@@ -31,6 +31,7 @@ from .utils import (
     process_chunks_unified,
     build_file_path,
     safe_vdb_operation_with_exception,
+    create_prefixed_exception,
 )
 from .base import (
     BaseGraphStorage,
@@ -870,6 +871,10 @@ async def _process_extraction_result(
             record = record.replace("<|>>", "<|>")
             # fix <<|> with <|>
             record = record.replace("<<|>", "<|>")
+            # fix <.|> with <|>
+            record = record.replace("<.|>", "<|>")
+            # fix <|.> with <|>
+            record = record.replace("<|.>", "<|>")
 
         record_attributes = split_string_by_multi_markers(record, [tuple_delimiter])
 
@@ -1391,9 +1396,9 @@ async def _merge_edges_then_upsert(
 
         # Log based on actual LLM usage
         if llm_was_used:
-            status_message = f"LLMmrg: `{src_id} - {tgt_id}` | {already_fragment}+{num_fragment-already_fragment}{dd_message}"
+            status_message = f"LLMmrg: `{src_id}`~`{tgt_id}` | {already_fragment}+{num_fragment-already_fragment}{dd_message}"
         else:
-            status_message = f"Merged: `{src_id} - {tgt_id}` | {already_fragment}+{num_fragment-already_fragment}{dd_message}"
+            status_message = f"Merged: `{src_id}`~`{tgt_id}` | {already_fragment}+{num_fragment-already_fragment}{dd_message}"
 
         logger.info(status_message)
         if pipeline_status is not None and pipeline_status_lock is not None:
@@ -1618,8 +1623,11 @@ async def merge_nodes_and_edges(
                             f"Failed to update pipeline status: {status_error}"
                         )
 
-                    # Re-raise the original exception
-                    raise
+                    # Re-raise the original exception with a prefix
+                    prefixed_exception = create_prefixed_exception(
+                        e, f"`{entity_name}`"
+                    )
+                    raise prefixed_exception from e
 
     # Create entity processing tasks
     entity_tasks = []
@@ -1749,8 +1757,11 @@ async def merge_nodes_and_edges(
                             f"Failed to update pipeline status: {status_error}"
                         )
 
-                    # Re-raise the original exception
-                    raise
+                    # Re-raise the original exception with a prefix
+                    prefixed_exception = create_prefixed_exception(
+                        e, f"{sorted_edge_key}"
+                    )
+                    raise prefixed_exception from e
 
     # Create relationship processing tasks
     edge_tasks = []
@@ -2066,11 +2077,14 @@ async def extract_entities(
         if pending:
             await asyncio.wait(pending)
 
-        # Re-raise the first exception to notify the caller
-        raise first_exception
+        # Add progress prefix to the exception message
+        progress_prefix = f"Chunks[{processed_chunks+1}/{total_chunks}]"
+
+        # Re-raise the original exception with a prefix
+        prefixed_exception = create_prefixed_exception(first_exception, progress_prefix)
+        raise prefixed_exception from first_exception
 
     # If all tasks completed successfully, chunk_results already contains the results
-
     # Return the chunk_results for later processing in merge_nodes_and_edges
     return chunk_results
 
