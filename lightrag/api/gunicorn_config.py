@@ -31,8 +31,9 @@ keyfile = None
 # Enable preload_app option
 preload_app = True
 
-# Use Uvicorn worker
-worker_class = "uvicorn.workers.UvicornWorker"
+# Use Uvicorn worker, subclassed so a worker whose master died stops serving
+# instead of holding the listening socket forever (see gunicorn_worker.py).
+worker_class = "lightrag.api.gunicorn_worker.LightRAGUvicornWorker"
 
 # Other Gunicorn configurations
 
@@ -129,12 +130,10 @@ def on_exit(server):
     print("=" * 80)
     print("GUNICORN MASTER PROCESS: Shutting down")
     print(f"Process ID: {os.getpid()}")
-    print("=" * 80)
 
-    # Release shared resources
+    print("Finalizing shared storage...")
     finalize_share_data()
 
-    print("=" * 80)
     print("Gunicorn shutdown complete")
     print("=" * 80)
 

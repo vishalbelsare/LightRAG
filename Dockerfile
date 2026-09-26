@@ -1,63 +1,146 @@
-# Build stage
-FROM python:3.12-slim AS builder
+# syntax=docker/dockerfile:1
+
+# Frontend build stage
+# Build frontend assets on the native build platform to avoid
+# cross-architecture emulation issues during multi-platform builds.
+FROM --platform=$BUILDPLATFORM oven/bun:1 AS frontend-builder
 
 WORKDIR /app
 
-# Upgrade pip、setuptools and wheel to the latest version
-RUN pip install --upgrade pip setuptools wheel
+# Copy frontend source code
+COPY lightrag_webui/ ./lightrag_webui/
 
-# Install Rust and required build dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    build-essential \
-    pkg-config \
+# Build frontend assets for inclusion in the API package
+RUN --mount=type=cache,target=/root/.bun/install/cache \
+    cd lightrag_webui \
+    && bun install --frozen-lockfile \
+    && bun run build
+
+# Python build stage - using uv for faster package installation
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV UV_SYSTEM_PYTHON=1
+ENV UV_COMPILE_BYTECODE=1
+
+WORKDIR /app
+
+# Install system deps (Rust is required by some wheels)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        build-essential \
+        pkg-config \
     && rm -rf /var/lib/apt/lists/* \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && . $HOME/.cargo/env
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-# Copy pyproject.toml and source code for dependency installation
+ENV PATH="/root/.cargo/bin:/root/.local/bin:${PATH}"
+
+# Ensure shared data directory exists for uv caches
+RUN mkdir -p /root/.local/share/uv
+
+# Copy project metadata and sources
 COPY pyproject.toml .
 COPY setup.py .
+COPY uv.lock .
+
+# Install base, API, and offline extras without the project to improve caching
+RUN --mount=type=cache,target=/root/.local/share/uv \
+    uv sync --frozen --no-dev --extra api --extra offline --no-install-project --no-editable
+
+# Copy project sources after dependency layer
 COPY lightrag/ ./lightrag/
 
-# Install dependencies
-ENV PATH="/root/.cargo/bin:${PATH}"
-RUN pip install --user --no-cache-dir --use-pep517 .
-RUN pip install --user --no-cache-dir --use-pep517 .[api]
+# Include pre-built frontend assets from the previous stage
+COPY --from=frontend-builder /app/lightrag/api/webui ./lightrag/api/webui
 
-# Install depndencies for default storage
-RUN pip install --user --no-cache-dir nano-vectordb networkx
-# Install depndencies for default LLM
-RUN pip install --user --no-cache-dir openai ollama tiktoken
-# Install depndencies for default document loader
-RUN pip install --user --no-cache-dir pypdf2 python-docx python-pptx openpyxl
+# Sync project in non-editable mode and ensure pip is available for runtime installs
+RUN --mount=type=cache,target=/root/.local/share/uv \
+    uv sync --frozen --no-dev --extra api --extra offline --no-editable \
+    && /app/.venv/bin/python -m ensurepip --upgrade
+
+# Prepare offline cache directory, pre-populate tiktoken data, and download the
+# pinned spaCy model wheels for the docx smart_heading engine parameter.
+# Use uv run to execute commands from the virtual environment
+RUN mkdir -p /app/data/tiktoken \
+    && uv run lightrag-download-cache --cache-dir /app/data/tiktoken --spacy-dir /app/spacy_models || status=$?; \
+    if [ -n "${status:-}" ] && [ "$status" -ne 0 ] && [ "$status" -ne 2 ]; then exit "$status"; fi
 
 # Final stage
-FROM python:3.12-slim
+# Pin to bookworm: keeps Python 3.12 (venv compat with the builder stage) while
+# avoiding Debian trixie's perl 5.40.x exposure (CVE-2026-12087, no patch yet),
+# and aligns the final Debian release with the builder (also bookworm).
+FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
-# Upgrade pip and setuptools
-RUN pip install --upgrade pip setuptools wheel
+# Install uv for package management
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# Copy only necessary files from builder
+ENV UV_SYSTEM_PYTHON=1
+
+# Copy installed packages and application code
 COPY --from=builder /root/.local /root/.local
-COPY ./lightrag ./lightrag
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/lightrag ./lightrag
+COPY pyproject.toml .
 COPY setup.py .
+COPY uv.lock .
 
-RUN pip install --use-pep517 ".[api]"
-# Make sure scripts in .local are usable
-ENV PATH=/root/.local/bin:$PATH
+# Ensure the installed scripts are on PATH
+ENV PATH=/app/.venv/bin:/root/.local/bin:$PATH
 
-# Create necessary directories
-RUN mkdir -p /app/data/rag_storage /app/data/inputs
+# Install dependencies with uv sync (uses locked versions from uv.lock)
+# and ensure pip is available for runtime installs. The pinned spaCy model
+# wheels (docx smart_heading) MUST be installed after uv sync — sync is exact
+# and would remove packages that are not in the lock. The bind mount exposes
+# the wheels downloaded in the builder stage without adding an image layer.
+RUN --mount=type=cache,target=/root/.local/share/uv \
+    --mount=type=bind,from=builder,source=/app/spacy_models,target=/tmp/spacy_models \
+    uv sync --frozen --no-dev --extra api --extra offline --no-editable \
+    && /app/.venv/bin/python -m ensurepip --upgrade \
+    && /app/.venv/bin/python -m pip install --no-index --no-cache-dir \
+        --find-links=/tmp/spacy_models zh_core_web_sm en_core_web_sm
 
-# Docker data directories
+# Create persistent data directories AFTER package installation
+RUN mkdir -p /app/data/rag_storage /app/data/inputs /app/data/prompts /app/data/tiktoken
+
+# Copy offline cache into the newly created directory
+COPY --from=builder /app/data/tiktoken /app/data/tiktoken
+
+# Point to the prepared cache
+ENV TIKTOKEN_CACHE_DIR=/app/data/tiktoken
 ENV WORKING_DIR=/app/data/rag_storage
 ENV INPUT_DIR=/app/data/inputs
+ENV PROMPT_DIR=/app/data/prompts
 
-# Expose the default port
+# Create a non-root user (CIS Docker 4.1) and install gosu for privilege drop.
+# Fixed UID/GID 1000 gives predictable ownership for bind-mounts / PVCs.
+# libcairo2 is the native library cairosvg (SVG->PNG rasterization for native
+# markdown images) binds to via cffi at runtime; cairosvg installs fine without
+# it but svg2png() fails with "no library called cairo-2 was found".
+# chown -R /app MUST run after every data COPY above so the venv (pipmaster
+# installs packages at runtime), data dirs, and the tiktoken cache are writable.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu libcairo2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 1000 lightrag \
+    && useradd -u 1000 -g lightrag -m -d /home/lightrag -s /usr/sbin/nologin lightrag \
+    && chown -R lightrag:lightrag /app /home/lightrag
+
+# HOME and cache dirs for the non-root user so pipmaster's runtime pip installs
+# never fall back to an unwritable /root or a missing HOME.
+ENV HOME=/home/lightrag \
+    XDG_CACHE_HOME=/home/lightrag/.cache \
+    PIP_CACHE_DIR=/home/lightrag/.cache/pip \
+    UV_CACHE_DIR=/home/lightrag/.cache/uv
+
+# Entrypoint starts as root, fixes mount ownership, then drops to lightrag.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Expose API port
 EXPOSE 9621
 
-# Set entrypoint
-ENTRYPOINT ["python", "-m", "lightrag.api.lightrag_server"]
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["python", "-m", "lightrag.api.lightrag_server"]

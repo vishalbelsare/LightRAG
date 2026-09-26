@@ -1,3 +1,19 @@
+/**
+ * NOT LOADED BY THE BUILD. Tailwind v4 (`@tailwindcss/vite` + the
+ * `@import 'tailwindcss'` in `src/index.css`) reads a JS config only when a
+ * stylesheet points at one with `@config`, and none does — the live
+ * configuration is `src/index.css`: `@plugin` registers the plugins, and the
+ * theme is the CSS custom properties there.
+ *
+ * Do NOT "fix" that by adding `@config './tailwind.config.js'`: the colors
+ * below wrap `var(--border)` etc. in `hsl()`, while index.css already
+ * defines those variables as complete `hsl(...)` colors — loading this file
+ * would produce `hsl(hsl(...))` and break every themed color in the app.
+ * Kept for editor tooling and as the record of the pre-v4 setup.
+ */
+import tailwindcssAnimate from 'tailwindcss-animate'
+import typography from '@tailwindcss/typography'
+
 /** @type {import('tailwindcss').Config} */
 export default {
   darkMode: ['class'],
@@ -262,11 +278,5 @@ export default {
       },
     },
   },
-  plugins: [
-    // Using ES module imports
-    // Note: This assumes these packages support ES module imports
-    // If issues occur, may need to fallback to require() and disable ESLint rules
-    import('tailwindcss-animate').then(module => module.default),
-    import('@tailwindcss/typography').then(module => module.default),
-  ],
+  plugins: [tailwindcssAnimate, typography],
 }
